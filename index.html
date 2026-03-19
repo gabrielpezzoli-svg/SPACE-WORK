@@ -48,9 +48,41 @@
   let localStream = null;
   let callDocId = null;
   let micOn = true, camOn = false, screenOn = false;
+  let unsubCallDoc = null, unsubAnswerC = null, unsubOfferC = null;
+
+  // Sonnerie via Web Audio API
+  let ringCtx = null, ringTimer = null;
+  function startRing(isCallee) {
+    stopRing();
+    ringCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const freqs = isCallee ? [440, 520] : [480];
+    let step = 0;
+    const beep = () => {
+      if(!ringCtx) return;
+      const o = ringCtx.createOscillator();
+      const g = ringCtx.createGain();
+      o.frequency.value = freqs[step % freqs.length];
+      o.connect(g); g.connect(ringCtx.destination);
+      g.gain.setValueAtTime(0.15, ringCtx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, ringCtx.currentTime + 0.35);
+      o.start(); o.stop(ringCtx.currentTime + 0.35);
+      step++;
+    };
+    beep();
+    ringTimer = setInterval(beep, isCallee ? 600 : 1800);
+  }
+  function stopRing() {
+    if(ringTimer) { clearInterval(ringTimer); ringTimer = null; }
+    if(ringCtx) { try { ringCtx.close(); } catch(e){} ringCtx = null; }
+  }
 
   async function getLocalStream() {
-    localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    } catch(e) {
+      showToast('Micro non autorisé', true);
+      localStream = new MediaStream();
+    }
     document.getElementById('local-video').srcObject = localStream;
     micOn = true; camOn = false;
     updateCtrlBtns();
@@ -75,13 +107,15 @@
           s ? s.replaceTrack(vt) : pc.addTrack(vt, localStream);
         }
         camOn = true;
+        const lv = document.getElementById('local-video');
+        lv.srcObject = localStream; lv.style.display = 'block';
       } catch(e) { showToast('Caméra non dispo', true); return; }
     } else {
       localStream.getVideoTracks().forEach(t => { t.stop(); localStream.removeTrack(t); });
       if(pc) { const s = pc.getSenders().find(s => s.track?.kind==='video'); if(s) s.replaceTrack(null); }
       camOn = false;
+      document.getElementById('local-video').style.display = 'none';
     }
-    document.getElementById('local-video').srcObject = localStream;
     updateCtrlBtns();
   };
 
@@ -116,10 +150,14 @@
 
   window.startCall = async (targetUid, targetName) => {
     showCallOverlay('calling', targetName);
+    startRing(false);
     await getLocalStream();
     pc = new RTCPeerConnection(ICE);
     localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-    pc.ontrack = e => { document.getElementById('remote-video').srcObject = e.streams[0]; };
+    pc.ontrack = e => {
+      const rv = document.getElementById('remote-video');
+      rv.srcObject = e.streams[0]; rv.style.display = 'block';
+    };
 
     callDocId = `call_${currentUser.uid}_${Date.now()}`;
     const callRef = doc(db, 'calls', callDocId);
@@ -137,27 +175,35 @@
       status: 'ringing', ts: serverTimestamp()
     });
 
-    onSnapshot(callRef, async snap => {
+    unsubCallDoc = onSnapshot(callRef, async snap => {
       const d = snap.data(); if(!d) return;
-      if(d.answer && !pc.currentRemoteDescription) {
+      if(d.answer && pc && !pc.currentRemoteDescription) {
+        stopRing();
         await pc.setRemoteDescription(new RTCSessionDescription(d.answer));
         showCallOverlay('incall', targetName);
       }
       if(d.status === 'ended') endCallCleanup();
     });
-    onSnapshot(answerC, snap => {
-      snap.docChanges().forEach(ch => { if(ch.type==='added') pc.addIceCandidate(new RTCIceCandidate(ch.doc.data())); });
+    unsubAnswerC = onSnapshot(answerC, snap => {
+      snap.docChanges().forEach(ch => { if(ch.type==='added' && pc) pc.addIceCandidate(new RTCIceCandidate(ch.doc.data())).catch(()=>{}); });
     });
   };
 
   window.answerCall = async () => {
+    stopRing();
     const callRef = doc(db, 'calls', callDocId);
-    const callData = (await getDoc(callRef)).data();
+    const snap = await getDoc(callRef);
+    if(!snap.exists()) { endCallCleanup(); return; }
+    const callData = snap.data();
+    document.getElementById('incoming-overlay').style.display = 'none';
     showCallOverlay('incall', callData.callerName);
     await getLocalStream();
     pc = new RTCPeerConnection(ICE);
     localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-    pc.ontrack = e => { document.getElementById('remote-video').srcObject = e.streams[0]; };
+    pc.ontrack = e => {
+      const rv = document.getElementById('remote-video');
+      rv.srcObject = e.streams[0]; rv.style.display = 'block';
+    };
 
     const offerC = collection(callRef, 'offerCandidates');
     const answerC = collection(callRef, 'answerCandidates');
@@ -168,10 +214,13 @@
     await pc.setLocalDescription(answer);
     await updateDoc(callRef, { answer: { type: answer.type, sdp: answer.sdp }, status: 'active' });
 
-    onSnapshot(offerC, snap => {
-      snap.docChanges().forEach(ch => { if(ch.type==='added') pc.addIceCandidate(new RTCIceCandidate(ch.doc.data())); });
+    unsubCallDoc = onSnapshot(callRef, s => {
+      const d = s.data(); if(!d) return;
+      if(d.status === 'ended') endCallCleanup();
     });
-    document.getElementById('incoming-overlay').style.display = 'none';
+    unsubOfferC = onSnapshot(offerC, snap => {
+      snap.docChanges().forEach(ch => { if(ch.type==='added' && pc) pc.addIceCandidate(new RTCIceCandidate(ch.doc.data())).catch(()=>{}); });
+    });
   };
 
   window.hangUp = async () => {
@@ -180,26 +229,32 @@
   };
 
   window.declineCall = async () => {
+    stopRing();
     if(callDocId) { try { await updateDoc(doc(db,'calls',callDocId),{status:'ended'}); } catch(e){} }
     document.getElementById('incoming-overlay').style.display = 'none';
     callDocId = null;
   };
 
   function endCallCleanup() {
+    stopRing();
+    if(unsubCallDoc) { unsubCallDoc(); unsubCallDoc = null; }
+    if(unsubAnswerC) { unsubAnswerC(); unsubAnswerC = null; }
+    if(unsubOfferC) { unsubOfferC(); unsubOfferC = null; }
     if(pc) { pc.close(); pc = null; }
     if(localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+    const rv = document.getElementById('remote-video');
+    const lv = document.getElementById('local-video');
+    rv.srcObject = null; rv.style.display = 'none';
+    lv.srcObject = null; lv.style.display = 'none';
     document.getElementById('call-overlay').style.display = 'none';
     document.getElementById('incoming-overlay').style.display = 'none';
-    document.getElementById('remote-video').srcObject = null;
-    document.getElementById('local-video').srcObject = null;
     callDocId = null; micOn = true; camOn = false; screenOn = false;
   }
 
   function showCallOverlay(state, name) {
-    const ov = document.getElementById('call-overlay');
-    ov.style.display = 'flex';
+    document.getElementById('call-overlay').style.display = 'flex';
     document.getElementById('call-name').textContent = name;
-    document.getElementById('call-status').textContent = state === 'calling' ? 'Appel en cours...' : '🔴 En communication';
+    document.getElementById('call-status').textContent = state === 'calling' ? '📳 Appel en cours...' : '🔴 En communication';
   }
 
   function listenIncomingCalls() {
@@ -212,6 +267,7 @@
           callDocId = ch.doc.id;
           document.getElementById('incoming-caller').textContent = d.callerName;
           document.getElementById('incoming-overlay').style.display = 'flex';
+          startRing(true);
         }
       });
     });
@@ -718,8 +774,8 @@ function handlePinInput(v){ pinValue=v; updatePinDots(); if(v.length===4) setTim
     <div id="call-status">Appel en cours...</div>
   </div>
   <div class="video-area">
-    <video id="remote-video" autoplay playsinline></video>
-    <video id="local-video" autoplay playsinline muted></video>
+    <video id="remote-video" autoplay playsinline style="display:none"></video>
+    <video id="local-video" autoplay playsinline muted style="display:none"></video>
   </div>
   <div class="call-controls">
     <button class="ctrl-btn" id="btn-mic" onclick="toggleMic()" title="Micro">🎤</button>
