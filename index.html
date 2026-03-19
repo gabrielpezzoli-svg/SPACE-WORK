@@ -76,6 +76,14 @@
     if(ringCtx) { try { ringCtx.close(); } catch(e){} ringCtx = null; }
   }
 
+  function setVideo(id, stream, show) {
+    const el = document.getElementById(id);
+    if(!el) return;
+    el.srcObject = stream;
+    el.style.display = show ? 'block' : 'none';
+    if(stream && show) el.play().catch(()=>{});
+  }
+
   async function getLocalStream() {
     try {
       localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
@@ -83,7 +91,7 @@
       showToast('Micro non autorisé', true);
       localStream = new MediaStream();
     }
-    document.getElementById('local-video').srcObject = localStream;
+    setVideo('local-video', localStream, false);
     micOn = true; camOn = false;
     updateCtrlBtns();
   }
@@ -107,14 +115,13 @@
           s ? s.replaceTrack(vt) : pc.addTrack(vt, localStream);
         }
         camOn = true;
-        const lv = document.getElementById('local-video');
-        lv.srcObject = localStream; lv.style.display = 'block';
+        setVideo('local-video', localStream, true);
       } catch(e) { showToast('Caméra non dispo', true); return; }
     } else {
       localStream.getVideoTracks().forEach(t => { t.stop(); localStream.removeTrack(t); });
       if(pc) { const s = pc.getSenders().find(s => s.track?.kind==='video'); if(s) s.replaceTrack(null); }
       camOn = false;
-      document.getElementById('local-video').style.display = 'none';
+      setVideo('local-video', localStream, false);
     }
     updateCtrlBtns();
   };
@@ -154,12 +161,7 @@
     await getLocalStream();
     pc = new RTCPeerConnection(ICE);
     localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-    pc.ontrack = e => {
-      const rv = document.getElementById('remote-video');
-      rv.srcObject = e.streams[0]; rv.style.display = 'block';
-    };
-
-    callDocId = `call_${currentUser.uid}_${Date.now()}`;
+    pc.ontrack = e => { setVideo('remote-video', e.streams[0], true); };
     const callRef = doc(db, 'calls', callDocId);
     const offerC = collection(callRef, 'offerCandidates');
     const answerC = collection(callRef, 'answerCandidates');
@@ -200,10 +202,7 @@
     await getLocalStream();
     pc = new RTCPeerConnection(ICE);
     localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-    pc.ontrack = e => {
-      const rv = document.getElementById('remote-video');
-      rv.srcObject = e.streams[0]; rv.style.display = 'block';
-    };
+    pc.ontrack = e => { setVideo('remote-video', e.streams[0], true); };
 
     const offerC = collection(callRef, 'offerCandidates');
     const answerC = collection(callRef, 'answerCandidates');
@@ -242,10 +241,8 @@
     if(unsubOfferC) { unsubOfferC(); unsubOfferC = null; }
     if(pc) { pc.close(); pc = null; }
     if(localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
-    const rv = document.getElementById('remote-video');
-    const lv = document.getElementById('local-video');
-    rv.srcObject = null; rv.style.display = 'none';
-    lv.srcObject = null; lv.style.display = 'none';
+    setVideo('remote-video', null, false);
+    setVideo('local-video', null, false);
     document.getElementById('call-overlay').style.display = 'none';
     document.getElementById('incoming-overlay').style.display = 'none';
     callDocId = null; micOn = true; camOn = false; screenOn = false;
@@ -605,9 +602,9 @@
   .call-av-big{width:80px;height:80px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;font-size:32px;margin:0 auto 1rem;}
   #call-name{font-size:22px;font-weight:600;margin-bottom:.4rem;}
   #call-status{font-size:13px;color:var(--muted);}
-  .video-area{display:flex;gap:10px;width:100%;max-width:480px;align-items:flex-end;}
-  #remote-video{flex:1;border-radius:14px;background:var(--surface2);max-height:220px;object-fit:cover;min-height:120px;}
-  #local-video{width:80px;height:110px;border-radius:10px;background:var(--surface2);object-fit:cover;flex-shrink:0;}
+  .video-area{width:100%;max-width:480px;position:relative;min-height:60px;}
+  #remote-video{width:100%;max-height:240px;min-height:160px;border-radius:14px;background:var(--surface2);object-fit:cover;display:block;}
+  #local-video{position:absolute;bottom:8px;right:8px;width:80px;height:110px;border-radius:10px;background:var(--surface2);object-fit:cover;border:2px solid var(--bg);display:none;}
   .call-controls{display:flex;gap:14px;align-items:center;justify-content:center;flex-wrap:wrap;}
   .ctrl-btn{width:54px;height:54px;border-radius:50%;border:none;font-size:20px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:transform .15s,background .15s;background:var(--surface2);color:var(--text);}
   .ctrl-btn:active{transform:scale(.88);}
@@ -774,7 +771,7 @@ function handlePinInput(v){ pinValue=v; updatePinDots(); if(v.length===4) setTim
     <div id="call-status">Appel en cours...</div>
   </div>
   <div class="video-area">
-    <video id="remote-video" autoplay playsinline style="display:none"></video>
+    <video id="remote-video" autoplay playsinline></video>
     <video id="local-video" autoplay playsinline muted style="display:none"></video>
   </div>
   <div class="call-controls">
